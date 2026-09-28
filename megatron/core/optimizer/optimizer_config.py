@@ -289,6 +289,17 @@ class OptimizerConfig:
     """Optimizer for nonlinear parameters (embeddings, biases, norms) when using muon.
     One of 'adam' or 'lion'. Defaults to 'adam'."""
 
+    muon_zero_parallelism: int = 0
+    """Maximum ZeRO sharding group size for Muon (dense matrix) parameters. 0 = no limit
+    (shard Muon matrices across the full current data-parallel group, i.e. current behavior).
+    With Z >= 1: Muon matrices are sharded across ``min(dp_cp, Z)`` ranks and redundantly
+    updated across ``ceil(dp_cp / Z)`` replica groups (compute-for-memory). Scalar (Adam/Lion)
+    parameters stay full-ZeRO and are unaffected.
+    
+    Set via ``--muon-zero-parallelism`` (the field name matches the arg, so it is populated
+    automatically from args). It is converted in ``validate_args`` to
+    ``num_distributed_optimizer_instances = ceil(dp_cp / Z)`` before process-group initialization."""
+
     # Lion.
     lion_beta1: float = 0.95
     """First beta coefficient for Lion optimizer (used in sign update). Defaults to 0.95."""

@@ -540,6 +540,71 @@ class TestLayerWiseOptimizer:
                     # DP component should be 0 for layer-wise optimizer
                     assert sh_base.replica_id[2] == 0
 
+    def test_layer_wise_optimizer_hybrid_replica_id_skips_expert(self):
+        """Hybrid ZeRO (N > 1) replica_id semantics for MoE + dense checkpoints.
+
+        Dense Muon momentum/fp32 states are redundantly held by N replica groups, so their
+        `replica_id` DP component is overridden to the inter-replica rank (`inter_rank`).
+        Expert-parallel (MoE) matrices are uniquely owned within the expert-DP group and are
+        NOT replicated, so their model-inherited `replica_id` must be left untouched. A fake
+        `inter_dist_opt` group is injected directly to exercise the override branch without
+        a full multi-instance process-group setup.
+        """
+        tp, pp, ep = 2, 1, 2
+        if tp * pp * ep > torch.distributed.get_world_size():
+            pytest.skip("TP*PP*EP > world size")
+
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp,
+            pipeline_model_parallel_size=pp,
+            expert_model_parallel_size=ep,
+        )
+
+        model, optimizer = setup_moe_model_and_optimizer(
+            seed=2,
+            tp=tp,
+            pp=pp,
+            ep=ep,
+            bf16=True,
+            dist_opt=True,
+            optimizer='dist_muon',
+            use_param_layout=True,
+        )
+
+        layerwise = optimizer
+        if isinstance(layerwise, ChainedOptimizer):
+            layerwise = next(
+                c for c in layerwise.chained_optimizers if isinstance(c, LayerWiseDistributedOptimizer)
+            )
+        assert isinstance(layerwise, LayerWiseDistributedOptimizer)
+
+        # Inject a replica group whose rank cannot collide with an expert-DP rank (0/1 here) so
+        # overridden dense states (== inter_rank) stay distinguishable from skipped expert states.
+        inter_rank = 7
+        mock_group = mock.Mock()
+        mock_group.rank.return_value = inter_rank
+        if layerwise.pg_collection is None:
+            layerwise.pg_collection = ProcessGroupCollection()
+        layerwise.pg_collection.inter_dist_opt = mock_group
+
+        optim_sd = layerwise.sharded_state_dict(model[0].sharded_state_dict())
+
+        from megatron.core.dist_checkpointing import ShardedTensor
+
+        dp_ranks = {
+            sh_base.replica_id[2]
+            for sh_base in nested_values(optim_sd)
+            if isinstance(sh_base, ShardedTensor)
+        }
+        # Dense Muon states were overridden to inter_rank; expert states were left alone.
+        assert inter_rank in dp_ranks, (
+            f"expected dense Muon momentum/fp32 replica_id DP == {inter_rank}; got {dp_ranks}"
+        )
+        assert any(rank != inter_rank for rank in dp_ranks), (
+            f"expected expert momentum/fp32 replica_id DP to be preserved (!= {inter_rank}); "
+            f"got {dp_ranks}"
+        )
+
     @pytest.mark.parametrize('dp_size', [1, 2, 4])
     def test_layer_wise_optimizer_dp_sizes(self, dp_size):
         """Test LayerWiseDistributedOptimizer with different DP sizes."""
@@ -765,6 +830,80 @@ class TestLayerWiseOptimizer:
                     tp=tp,
                     pp=pp,
                     initialize_fn=initialize_gpt_model,
+                    dist_opt=True,
+                    optimizer='dist_muon',
+                    use_param_layout=True,
+                )
+
+                load_checkpoint_no_arg_checks(model, optimizer_B, None)
+
+                optim_param_state_B = optimizer_B.state_dict()
+
+                check_equal(optim_param_state_A, optim_param_state_B)
+
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize('tp', [1, 2])
+    @pytest.mark.parametrize('pp', [1, 2])
+    def test_optimizer_common_state_dict_hybrid_moe(self, tmp_path_dist_ckpt, tp, pp):
+        """End-to-end `save_checkpoint`/`load_checkpoint` roundtrip on the hybrid
+        LayerWise + DistributedOptimizer path with an MoE model.
+
+        Expert-parallel (MoE) matrices are uniquely owned within the expert-DP group and must
+        round-trip through their model-inherited `replica_id`, while dense Muon matrices and
+        the Adam-managed scalar params each use their own replica semantics. Complements
+        `test_optimizer_common_state_dict_hybrid` (dense only) by exercising the expert-DP
+        sharding dimension.
+        """
+        ep = 2  # keep expert parallelism on so expert-DP sharding is actually exercised
+        if tp * pp * ep > 8:
+            pytest.skip("TP*PP*EP > 8 is larger than world size")
+
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp,
+            pipeline_model_parallel_size=pp,
+            expert_model_parallel_size=ep,
+        )
+
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_optimizer_common_state_dict_hybrid_moe', sync=True
+        ) as ckpt_dir:
+            mock_args = parse_args(ignore_unknown_args=True)
+            # Mirror the arg-parser's Muon path (see test_optimizer_common_state_dict_hybrid).
+            mock_args.use_distributed_optimizer = False
+            mock_args.use_layer_wise_distributed_optimizer = True
+            with mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args):
+                model, optimizer_A = setup_moe_model_and_optimizer(
+                    seed=2,
+                    tp=tp,
+                    pp=pp,
+                    ep=ep,
+                    bf16=True,
+                    dist_opt=True,
+                    optimizer='dist_muon',
+                    use_param_layout=True,
+                )
+
+                init_checkpointing_mock_args(mock_args, ckpt_dir, fully_parallel=True)
+                from megatron.training.training import preprocess_common_state_dict
+
+                save_checkpoint(
+                    10,
+                    model,
+                    optimizer_A,
+                    None,
+                    0,
+                    preprocess_common_state_dict_fn=preprocess_common_state_dict,
+                )
+
+                optim_param_state_A = optimizer_A.state_dict()
+
+                model, optimizer_B = setup_moe_model_and_optimizer(
+                    seed=3,
+                    tp=tp,
+                    pp=pp,
+                    ep=ep,
+                    bf16=True,
                     dist_opt=True,
                     optimizer='dist_muon',
                     use_param_layout=True,

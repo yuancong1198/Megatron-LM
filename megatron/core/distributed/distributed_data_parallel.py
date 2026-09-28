@@ -177,17 +177,32 @@ class DistributedDataParallel(_BaseDataParallel):
                 logging.WARNING,
                 "DistributedDataParallel: full_param_layout not provided with "
                 "use_distributed_optimizer=True. Auto-computing layout inside DDP. "
-                "Callers should pre-compute layouts via "
-                "DistributedOptimizer.compute_full_param_layout() and pass them in.",
+                "Callers should pre-compute layouts via compute_full_parallelayout()",
+                "and pass them in.",
             )
-            from ..optimizer.distrib_optimizer import DistributedOptimizer
+            # LayerWise-managed buffers shard within the intra dp_cp group (hybrid ZeRO),
+            # which DistributedOptimizer.compute_full_param_layout does not model: it lays
+            # every non-expert buffer out across the full dp_cp size, contradicting the
+            # intra-DP buffer assignment below. Route to the LayerWise layout computer when
+            # any buffer is LayerWise-managed (coupled or decoupled layer-wise path).
+            use_layer_wise_layout = getattr(
+                self.ddp_config, 'use_layer_wise_param_layout', False
+            ) or any(
+                buffer_key.is_managed_by_layer_wise_optimizer for buffer_key in buffer_groups
+            )
+            if use_layer_wise_layout:
+                from ..optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+                compute_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
+            else:
+                from ..optimizer.distrib_optimizer import DistributedOptimizer
+                compute_layout = DistributedOptimizer.compute_full_param_layout
 
-            full_param_layout = DistributedOptimizer.compute_full_param_layout(
+            full_param_layout = compute_layout(
                 all_params,
                 self.bucket_size,
-                self.intra_dp_cp_group.size(),
+                self.dp_cp_group.size(),
                 self.ddp_config,
-                expert_data_parallel_world_size=self.intra_expt_dp_group.size(),
+                expert_data_parallel_world_size=self.expt_dp_group.size(),
             )
 
         # When a full_param_layout is provided, verify that the grouping is consistent
@@ -251,10 +266,18 @@ class DistributedDataParallel(_BaseDataParallel):
         pg_collection = ProcessGroupCollection(tp=self.tp_group, dp_cp=self.dp_cp_group)
         for buffer_key, (params, param_indices) in buffer_groups.items():
             if buffer_key.is_expert_parallel:
-                data_parallel_group = self.intra_expt_dp_group
+                # MoE (expert-parallel) Muon matrices: shard across the FULL expert-DP group
+                # (no ZeRO parallelism limit for MoE). Each expert param is then owned by
+                # exactly one rank, with no redundant recompute across replicas.
+                data_parallel_group = self.expt_dp_group
                 scaling_factor = expert_gradient_scaling_factor
-            else:
+            elif buffer_key.is_managed_by_layer_wise_optimizer:
+                # Dense Muon matrices：shard within the intra dp_cp group (<= Z ranks).
                 data_parallel_group = self.intra_dp_cp_group
+                scaling_factor = gradient_scaling_factor
+            else:
+                # Scalar (Adam/Lion) params：full ZeRO over the whole dp_cp group.
+                data_parallel_group = self.dp_cp_group
                 scaling_factor = gradient_scaling_factor
 
             if not config.calculate_per_token_loss:
@@ -326,9 +349,15 @@ class DistributedDataParallel(_BaseDataParallel):
             assert (
                 self.ddp_config.use_distributed_optimizer
             ), 'Partial DistOpt cannot be used without DistOpt'
+            # Hybrid ZeRO: only bucket groups whose buffers keep the model-level
+            # num_distributed_optimizer_instances > 1 (Muon/LayerWise buffers) take the
+            # cross-replica inter all-reduce. Scalar (Adam) bucket groups are baked to N=1 and
+            # must not be assigned the inter group / communication stream.
             for bucket_groups in [self.bucket_groups, self.expert_parallel_bucket_groups]:
                 communication_stream = torch.cuda.Stream(device=torch.cuda.current_device())
                 for bucket_group in bucket_groups:
+                    if bucket_group.ddp_config.num_distributed_optimizer_instances <= 1:
+                        continue
                     bucket_group.inter_distributed_optimizer_instance_group = (
                         self.inter_dist_opt_group
                     )

@@ -830,14 +830,11 @@ def _get_megatron_emerging_optimizer(
     distopt_process_groups = None
     distopt_per_model_buffers = None
     use_separate_distributed_optimizer = ddp_uses_distributed_optimizer and use_layer_wise
-    if use_separate_distributed_optimizer:
-        ddp_config = model_chunks[0].ddp_config
-        assert ddp_config.num_distributed_optimizer_instances == 1, (
-            "Layer-wise + DistributedOptimizer split path does not yet support "
-            "num_distributed_optimizer_instances > 1: distributed_optimizer_instance_id "
-            "is hardcoded to 0 in this path. Disable use_layer_wise_param_layout to "
-            "fall back to the legacy LayerWise ping-pong path."
-        )
+    # NOTE: this split path (coupled layout, use_layer_wise_param_layout=True) now supports
+    # num_distributed_optimizer_instances > 1 via hybrid ZeRO: Muon (LayerWise) buffers shard within
+    # the intra dp_cp group (redundantly updated across N replicas) while the sibling
+    # DistributedOptimizer below routes scalar (Adam/Lion) params to the full dp_cp group with
+    # distributed_optimizer_instance_id=0 (a single owner set, so Adam keeps full ZeRO).
     if use_separate_distributed_optimizer and any(
         # A separate DistributedOptimizer with byte-level sharding handles any group
         # whose optimizer is not the primary emerging optimizer (stored in ``eopt_name``,
@@ -927,10 +924,16 @@ def _get_megatron_emerging_optimizer(
                     param_groups=groups,
                     per_model_buffers=distopt_per_model_buffers,
                     model_parallel_group=distopt_process_groups['mp_group'],
-                    data_parallel_group=distopt_process_groups['intra_dp_cp_group'],
-                    data_parallel_group_gloo=distopt_process_groups['intra_dp_cp_group_gloo'],
+                    data_parallel_group=distopt_process_groups['dp_cp_group'],
+                    data_parallel_group_gloo=None,
                     data_parallel_group_idx=get_pg_rank(distopt_process_groups['mp_group']),
-                    intra_dist_opt_group=distopt_process_groups['intra_dist_opt_group'],
+                    # Adam/Lion scalar params are full-ZeRO over the complete dp_cp group, so their
+                    # grad stats must reduce over their data_parallel_group (dp_cp). Passing None
+                    # makes DistributedOptimizer fall back to the world group (double-counting across
+                    # TP/PP), inconsistent with Muon's intra_dist_opt scope, which corrupts grad-norm
+                    # / clip / count_zeros. Use the dp_cp group explicitly; since it differs from
+                    # Muon's intra_dist_opt, the top-level ChainedOptimizer splits then merges.
+                    intra_dist_opt_group=distopt_process_groups['dp_cp_group'],
                     distributed_optimizer_instance_id=0,
                     pg_collection=pg_collection,
                     skip_megatron_wrapping=False,

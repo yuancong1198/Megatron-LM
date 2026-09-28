@@ -30,10 +30,19 @@ def _make_param(shape, dtype=torch.bfloat16, **attrs):
     return param
 
 
-def _make_ddp_config(pad_for_high_busbw=False, grad_reduce_in_fp32=True):
+def _make_ddp_config(
+    pad_for_high_busbw=False,
+    grad_reduce_in_fp32=True,
+    num_distributed_optimizer_instances=1,
+    use_layer_wise_param_layout=True,
+):
     cfg = mock.Mock()
     cfg.pad_buckets_for_high_nccl_busbw = pad_for_high_busbw
     cfg.grad_reduce_in_fp32 = grad_reduce_in_fp32
+    # compute_full_param_layout reads these via getattr; a bare Mock would return a
+    # Mock for them and break `data_parallel_world_size // num_distributed_optimizer_instances`.
+    cfg.num_distributed_optimizer_instances = num_distributed_optimizer_instances
+    cfg.use_layer_wise_param_layout = use_layer_wise_param_layout
     return cfg
 
 
@@ -391,3 +400,40 @@ class TestLayerwiseFullParamLayout:
         cfg = _make_ddp_config()
         layout = _LWO.compute_full_param_layout([dense, expert], None, dp_size, cfg)
         assert len(layout.layouts) == 2
+
+    def test_hybrid_muon_intra_adam_full_sharding(self):
+        """Hybrid ZeRO: dense Muon matrices shard over the intra subgroup (dp / N) while
+        Adam scalar params shard over the full DP group.
+
+        Verifies `compute_full_param_layout` splits the DP size by
+        `num_distributed_optimizer_instances` only for LayerWise-managed buffers.
+        """
+        dp_size = 4
+        num_instances = 2
+        intra = dp_size // num_instances  # 2
+
+        muon = [_make_param((256, 256)) for _ in range(4)]
+        adam = [_make_param((256,)) for _ in range(4)]
+        for p in muon:
+            p.is_managed_by_layer_wise_optimizer = True
+        for p in adam:
+            p.is_managed_by_layer_wise_optimizer = False
+
+        mixed = _LWO.compute_full_param_layout(
+            muon + adam,
+            None,
+            dp_size,
+            _make_ddp_config(num_distributed_optimizer_instances=num_instances),
+        )
+
+        # Reference layouts: Muon alone over intra (dp / N); Adam alone over full dp.
+        muon_ref = _LWO.compute_full_param_layout(muon, None, intra, _make_ddp_config())
+        adam_ref = _LWO.compute_full_param_layout(adam, None, dp_size, _make_ddp_config())
+
+        # Two buffer groups: LayerWise (Muon) vs non-LayerWise (Adam).
+        assert len(mixed.layouts) == 2
+        for key, per_layout in mixed.layouts.items():
+            ref = muon_ref if key.is_managed_by_layer_wise_optimizer else adam_ref
+            ref_key = list(ref.layouts.keys())[0]
+            assert per_layout.param_index_map == ref.layouts[ref_key].param_index_map
+            assert per_layout.bucket_indices == ref.layouts[ref_key].bucket_indices
