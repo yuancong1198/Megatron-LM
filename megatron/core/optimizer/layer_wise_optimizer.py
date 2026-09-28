@@ -108,7 +108,10 @@ def tag_params_for_buffer_routing(model_chunks) -> None:
             if not param.requires_grad:
                 continue
             param.is_managed_by_layer_wise_optimizer = is_managed_by_layer_wise_optimizer(param)
-            if 'linear_fc2' in name:
+            # Match the down-projection structurally: compare the exact terminal submodule
+            # attribute name (``linear_fc2``, the canonical Megatron MLP/Experts down-proj)
+            # rather than a substring search over the full dotted path.
+            if name.rsplit('.', 1)[0].rsplit('.', 1)[-1] == 'linear_fc2':
                 param.is_moe_down_proj = True
 
 def _grads_for_norm_in_group(optimizer, params):
@@ -1255,22 +1258,61 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # num_distributed_optimizer_instances == 1, i.e. the fixed-DP case), so the N copies dedup
         # to the main replica (inter_rank == 0) on save and reconstruct on load.
         inter_rank = 0
-        if self.pg_collection is not None and getattr(
-            self.pg_collection, 'inter_dist_opt', None
-        ) is not None:
+        has_inter_dist_opt = (
+            self.pg_collection is not None
+            and getattr(self.pg_collection, 'inter_dist_opt', None) is not None
+        )
+        if has_inter_dist_opt:
             inter_rank = get_pg_rank(self.pg_collection.inter_dist_opt)
 
-        # for fixed DP usage only
-        for sh_base in nested_values(sharded_state_dict):
-            if hasattr(sh_base, 'replica_id'):
-                assert (
-                    isinstance(sh_base.replica_id, int) or len(sh_base.replica_id) == 3
-                ), f'Expected replica_id as int or (PP, TP, DP), got: {sh_base}'
-                sh_base.replica_id = (
-                    inter_rank
-                    if isinstance(sh_base.replica_id, int)
-                    else (*sh_base.replica_id[:2], inter_rank)
-                )
+        def _set_replica_id(sh_base):
+            assert (
+                isinstance(sh_base.replica_id, int) or len(sh_base.replica_id) == 3
+            ), f'Expected replica_id as int or (PP, TP, DP), got: {sh_base}'
+            sh_base.replica_id = (
+                inter_rank
+                if isinstance(sh_base.replica_id, int)
+                else (*sh_base.replica_id[:2], inter_rank)
+            )
+
+        if has_inter_dist_opt:
+            # Hybrid ZeRO (N > 1): only dense Muon momentum/fp32 states are redundantly held by N
+            # replica groups. Expert-parallel MoE matrices are uniquely owned within the full
+            # expert-DP group and are NOT replicated, so leave their model-inherited replica_id
+            # untouched. The returned state dict (single Muon child in the coupled path) carries
+            # ``is_expert_parallel`` on its param_groups, whose state ids match the ``state`` keys.
+            optimizer_state = sharded_state_dict.get('optimizer', sharded_state_dict)
+            param_groups = optimizer_state.get('param_groups', [])
+            expert_state_ids = set()
+            for group in param_groups:
+                if not group.get('is_expert_parallel', False):
+                    continue
+                group_params = group['params']
+                if hasattr(group_params, 'unwrap'):
+                    group_params = group_params.unwrap()
+                expert_state_ids.update(group_params)
+
+            for param_id, param_state in optimizer_state.get('state', {}).items():
+                if param_id in expert_state_ids:
+                    continue
+                for sh_base in param_state.values():
+                    if hasattr(sh_base, 'replica_id'):
+                        _set_replica_id(sh_base)
+
+            # fp32 main params (Float16 path) share the same replica semantics.
+            fp32_params = sharded_state_dict.get('fp32_from_fp16_params', [])
+            for group_idx, group in enumerate(param_groups):
+                if group.get('is_expert_parallel', False) or group_idx >= len(fp32_params):
+                    continue
+                for sh_base in fp32_params[group_idx]:
+                    if hasattr(sh_base, 'replica_id'):
+                        _set_replica_id(sh_base)
+        else:
+            # Fixed DP (N == 1): no redundant replicas; keep the legacy uniform override, which
+            # also covers the multi-child (Muon + scalar) chained layout of the ping-pong path.
+            for sh_base in nested_values(sharded_state_dict):
+                if hasattr(sh_base, 'replica_id'):
+                    _set_replica_id(sh_base)
 
         # later code assume list but chained optimizer fallback to non-list if there's only one
         if len(self.chained_optimizers) == 1:
