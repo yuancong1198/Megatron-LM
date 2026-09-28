@@ -177,12 +177,27 @@ class DistributedDataParallel(_BaseDataParallel):
                 logging.WARNING,
                 "DistributedDataParallel: full_param_layout not provided with "
                 "use_distributed_optimizer=True. Auto-computing layout inside DDP. "
-                "Callers should pre-compute layouts via "
-                "DistributedOptimizer.compute_full_param_layout() and pass them in.",
+                "Callers should pre-compute layouts via compute_full_parallelayout()",
+                "and pass them in.",
             )
-            from ..optimizer.distrib_optimizer import DistributedOptimizer
+            # LayerWise-managed buffers shard within the intra dp_cp group (hybrid ZeRO),
+            # which DistributedOptimizer.compute_full_param_layout does not model: it lays
+            # every non-expert buffer out across the full dp_cp size, contradicting the
+            # intra-DP buffer assignment below. Route to the LayerWise layout computer when
+            # any buffer is LayerWise-managed (coupled or decoupled layer-wise path).
+            use_layer_wise_layout = getattr(
+                self.ddp_config, 'use_layer_wise_param_layout', False
+            ) or any(
+                buffer_key.is_managed_by_layer_wise_optimizer for buffer_key in buffer_groups
+            )
+            if use_layer_wise_layout:
+                from ..optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+                compute_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
+            else:
+                from ..optimizer.distrib_optimizer import DistributedOptimizer
+                compute_layout = DistributedOptimizer.compute_full_param_layout
 
-            full_param_layout = DistributedOptimizer.compute_full_param_layout(
+            full_param_layout = compute_layout(
                 all_params,
                 self.bucket_size,
                 self.dp_cp_group.size(),

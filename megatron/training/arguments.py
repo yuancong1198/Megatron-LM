@@ -427,6 +427,32 @@ def tuple_type(x):
     assert isinstance(x, str)
     return tuple(int(i) for i in x.strip('()').split(','))
 
+def _derive_muon_num_distributed_optimizer_instances(muon_zero_parallelism, dp_cp, expert_dp=None):
+    """Derive `num_distributed_optimizer_instances` (N) from the Muon ZeRO limit Z.
+
+    `N = ceil(dp_cp / Z)`; returns 1 (no redundancy) when Z <= 0 (no limit) or
+    `Z >= dp_cp` (the limit does not constrain the current data-parallel group).
+    Raises `AssertionError` if the derived `N` does not evenly divide `dp_cp`
+    (or `expert_dp`, when expert parallelism is active).
+    """
+    if muon_zero_parallelism <= 0 or muon_zero_parallelism >= dp_cp:
+        return 1
+    num_instances = -(-dp_cp // muon_zero_parallelism)  # ceil(dp_cp / Z)
+    assert dp_cp % num_instances == 0, (
+        f"muon_zero_parallelism={muon_zero_parallelism} yields "
+        f"num_distributed_optimizer_instances={num_instances}, which must evenly "
+        f"divide data_parallel_size * context_parallel_size = {dp_cp}. "
+        f"Choose a Z that divides dp*cp evenly."
+    )
+    if expert_dp is not None:
+        assert expert_dp % num_instances == 0, (
+            f"muon_zero_parallelism={muon_zero_parallelism} yields "
+            f"num_distributed_optimizer_instances={num_instances}, which must evenly "
+            f"divide the expert data-parallel size {expert_dp}. "
+            f"Choose a Z whose derived N divides both dp*cp and expert_dp."
+        )
+    return num_instances
+
 
 def validate_args(args, defaults={}):
 
@@ -1911,17 +1937,11 @@ def validate_args(args, defaults={}):
             )
             dp_cp = args.data_parallel_size * args.context_parallel_size
             if muon_zero_parallelism < dp_cp:
-                num_instances = -(dp_cp // muon_zero_parallelism) # ceil(dp_cp / Z)
-                assert dp_cp % num_instances == 0, (
-                    f"muon_zero_parallelism={muon_zero_parallelism} yields "
-                    f"num_distributed_optimizer_instances={num_instances}, which must evenly "
-                    f"divide data_parallel_size * context_parallel_size = {dp_cp}."
-                    f"Choose a Z that divides dp*cp evenly."
-                )
                 # MoE (expert-parallel) Muon matrices are sharded across the FULL expert-DP group
                 # (no ZeRO limit). This assert only keeps the partial-ZeRO intra_expt_dp process
                 # group well-formed; MoE no longer shards over intra_expt_dp.
                 expert_parallel_size = getattr(args, 'expert_model_parallel_size', 1) or 1
+                expert_dp = None
                 if expert_parallel_size > 1:
                     expert_dp = (
                         args.data_parallel_size
@@ -1929,16 +1949,11 @@ def validate_args(args, defaults={}):
                         * args.context_parallel_size
                         // (args.expert_tensor_parallel_size * expert_parallel_size)
                     )
-                    assert expert_dp % num_instances == 0, (
-                        f"muon_zero_parallelism={muon_zero_parallelism} yields "
-                        f"num_distributed_optimizer_instances={num_instances}, which must evenly "
-                        f"divide the expert data-parallel size {expert_dp} "
-                        f"(data_parallel_size {args.data_parallel_size} * tp "
-                        f"{args.tensor_model_parallel_size} * cp {args.context_parallel_size} "
-                        f"/ (etp {args.expert_tensor_parallel_size} * ep {expert_parallel_size})). "
-                        f"Choose a Z whose derived N divides both dp*cp and expert_dp."
+                args.num_distributed_optimizer_instances = (
+                    _derive_muon_num_distributed_optimizer_instances(
+                        muon_zero_parallelism, dp_cp, expert_dp
                     )
-                args.num_distributed_optimizer_instances = num_instances
+                )
         # muon_zero_parallelism >= dp_cp: no cap, keep N == 1
 
         if not args.use_layer_wise_param_layout:

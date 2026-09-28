@@ -161,6 +161,41 @@ class TestGroupParamsForBuffers:
         assert bf16_key in result
         assert fp32_key in result
 
+    def test_layer_wise_managed_separate_buffer(self):
+        """LayerWise-managed (Muon) and non-managed (Adam) params get distinct collective keys."""
+        muon = _make_param_with_attrs((256, 256), is_managed_by_layer_wise_optimizer=True)
+        adam = _make_param_with_attrs((256,), is_managed_by_layer_wise_optimizer=False)
+        result = group_params_for_buffers([muon, adam], grad_reduce_in_fp32=True)
+
+        assert len(result) == 2
+        layerwise_key = BufferKey(torch.bfloat16, torch.float, False, True)
+        distopt_key = BufferKey(torch.bfloat16, torch.float, False, False)
+        assert layerwise_key in result
+        assert distopt_key in result
+        assert result[layerwise_key][0] == [muon]
+        assert result[distopt_key][0] == [adam]
+
+    def test_fp8_storage_uses_uint8_dtype(self):
+        """FP8 params key their storage dtype to uint8, a collective key distinct from bf16."""
+        bf16_param = _make_param_with_attrs((256, 256), is_managed_by_layer_wise_optimizer=True)
+        fp8_param = _make_param_with_attrs((256, 256), is_managed_by_layer_wise_optimizer=True)
+
+        def fake_quantized(param):
+            return param is fp8_param
+
+        with mock.patch(
+            'megatron.core.distributed.param_and_grad_buffer._param_uses_quantized_storage',
+            side_effect=fake_quantized,
+        ):
+            result = group_params_for_buffers([bf16_param, fp8_param], grad_reduce_in_fp32=True)
+
+        assert len(result) == 2
+        bf16_key = BufferKey(torch.bfloat16, torch.float, False, True)
+        fp8_key = BufferKey(torch.uint8, torch.float, False, True)
+        assert bf16_key in result
+        assert fp8_key in result
+        assert result[fp8_key][0] == [fp8_param]
+
 
 # ---------------------------------------------------------------------------
 # Tests for _compute_default_per_buffer_param_layout
