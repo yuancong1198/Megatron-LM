@@ -1242,6 +1242,71 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 ]
         super().load_state_dict(state_dict)
 
+    @staticmethod
+    def _set_hybrid_replica_id(sh_base, inter_rank: int):
+        """Overwrite the DP component of a state shard's `replica_id` with `inter_rank`.
+
+        The DP component encodes which inter-replica group redundantly holds this state; on
+        save the N replicas dedup to the primary replica (`inter_rank == 0`) and are rebuilt
+        on load.
+        """
+        assert (
+            isinstance(sh_base.replica_id, int) or len(sh_base.replica_id) == 3
+        ), f'Expected replica_id as int or (PP, TP, DP), got: {sh_base}'
+        sh_base.replica_id = (
+            inter_rank
+            if isinstance(sh_base.replica_id, int)
+            else (*sh_base.replica_id[:2], inter_rank)
+        )
+
+    @staticmethod
+    def _apply_hybrid_replica_id_overrides(sharded_state_dict, inter_rank: int):
+        """Apply hybrid-ZeRO `replica_id` overrides to a single optimizer's state dict.
+
+        Dense Muon momentum/fp32 states are redundantly held by N replica groups, so their
+        `replica_id` DP component is set to `inter_rank`. Expert-parallel (MoE) matrices are
+        uniquely owned within the expert-DP group and are NOT replicated; their model-inherited
+        `replica_id` is left untouched. Expert state ids are resolved from the
+        `is_expert_parallel` flag on each param group.
+        """
+        _set = LayerWiseDistributedOptimizer._set_hybrid_replica_id
+        optimizer_state = sharded_state_dict.get('optimizer', sharded_state_dict)
+        param_groups = optimizer_state.get('param_groups', [])
+
+        expert_state_ids = set()
+        for group in param_groups:
+            if not group.get('is_expert_parallel', False):
+                continue
+            group_params = group['params']
+            if hasattr(group_params, 'unwrap'):
+                group_params = group_params.unwrap()
+            if not isinstance(group_params, (list, tuple)):
+                raise RuntimeError(
+                    'LayerWiseDistributedOptimizer: cannot map expert-parallel param group to '
+                    f'optimizer state ids (got {type(group_params)} after unwrap). '
+                    'Expected a list/tuple of int param ids.'
+                )
+            expert_state_ids.update(int(pid) for pid in group_params)
+
+        for param_id, param_state in optimizer_state.get('state', {}).items():
+            if param_id in expert_state_ids:
+                continue
+            if not isinstance(param_state, dict):
+                # Skip scalar entries like 'common_step' injected by the base optimizer.
+                continue
+            for sh_base in param_state.values():
+                if hasattr(sh_base, 'replica_id'):
+                    _set(sh_base, inter_rank)
+
+        # fp32 main params (Float16 path) share the same replica semantics.
+        fp32_params = sharded_state_dict.get('fp32_from_fp16_params', [])
+        for group_idx, group in enumerate(param_groups):
+            if group.get('is_expert_parallel', False) or group_idx >= len(fp32_params):
+                continue
+            for sh_base in fp32_params[group_idx]:
+                if hasattr(sh_base, 'replica_id'):
+                    _set(sh_base, inter_rank)
+
     def sharded_state_dict(
         self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False, **kwargs
     ):
@@ -1265,54 +1330,18 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         if has_inter_dist_opt:
             inter_rank = get_pg_rank(self.pg_collection.inter_dist_opt)
 
-        def _set_replica_id(sh_base):
-            assert (
-                isinstance(sh_base.replica_id, int) or len(sh_base.replica_id) == 3
-            ), f'Expected replica_id as int or (PP, TP, DP), got: {sh_base}'
-            sh_base.replica_id = (
-                inter_rank
-                if isinstance(sh_base.replica_id, int)
-                else (*sh_base.replica_id[:2], inter_rank)
-            )
-
         if has_inter_dist_opt:
             # Hybrid ZeRO (N > 1): only dense Muon momentum/fp32 states are redundantly held by N
             # replica groups. Expert-parallel MoE matrices are uniquely owned within the full
             # expert-DP group and are NOT replicated, so leave their model-inherited replica_id
-            # untouched. The returned state dict (single Muon child in the coupled path) carries
-            # ``is_expert_parallel`` on its param_groups, whose state ids match the ``state`` keys.
-            optimizer_state = sharded_state_dict.get('optimizer', sharded_state_dict)
-            param_groups = optimizer_state.get('param_groups', [])
-            expert_state_ids = set()
-            for group in param_groups:
-                if not group.get('is_expert_parallel', False):
-                    continue
-                group_params = group['params']
-                if hasattr(group_params, 'unwrap'):
-                    group_params = group_params.unwrap()
-                expert_state_ids.update(group_params)
-
-            for param_id, param_state in optimizer_state.get('state', {}).items():
-                if param_id in expert_state_ids:
-                    continue
-                for sh_base in param_state.values():
-                    if hasattr(sh_base, 'replica_id'):
-                        _set_replica_id(sh_base)
-
-            # fp32 main params (Float16 path) share the same replica semantics.
-            fp32_params = sharded_state_dict.get('fp32_from_fp16_params', [])
-            for group_idx, group in enumerate(param_groups):
-                if group.get('is_expert_parallel', False) or group_idx >= len(fp32_params):
-                    continue
-                for sh_base in fp32_params[group_idx]:
-                    if hasattr(sh_base, 'replica_id'):
-                        _set_replica_id(sh_base)
+            # untouched. See apply_hybrid_replica_id_overrides for the semantics.
+            self._apply_hybrid_replica_id_overrides(sharded_state_dict, inter_rank)
         else:
             # Fixed DP (N == 1): no redundant replicas; keep the legacy uniform override, which
             # also covers the multi-child (Muon + scalar) chained layout of the ping-pong path.
             for sh_base in nested_values(sharded_state_dict):
                 if hasattr(sh_base, 'replica_id'):
-                    _set_replica_id(sh_base)
+                    self._set_hybrid_replica_id(sh_base, inter_rank)
 
         # later code assume list but chained optimizer fallback to non-list if there's only one
         if len(self.chained_optimizers) == 1:
