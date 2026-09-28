@@ -289,11 +289,16 @@ class OptimizerConfig:
     """Optimizer for nonlinear parameters (embeddings, biases, norms) when using muon.
     One of 'adam' or 'lion'. Defaults to 'adam'."""
 
-    muon_zero_parallelism: int = 2
-    """Muon (dense 矩阵) 参数的最大 ZeRO 分片组大小。0 = 不限制
-    设 Z >= 1 时: Muon 矩阵在 ``min(dp_cp, Z)`` 个 rank 内分片，并在 ``ceil(dp_cp / Z)``
-    个副本组上冗余计算 Muon 更新 (以计算换内存)。标量 (Adam/Lion) 参数保持全 ZeRO, 不受影响。"""
-
+    muon_zero_parallelism: int = 0
+    """Maximum ZeRO sharding group size for Muon (dense matrix) parameters. 0 = no limit
+    (shard Muon matrices across the full current data-parallel group, i.e. current behavior).
+    With Z >= 1: Muon matrices are sharded across ``min(dp_cp, Z)`` ranks and redundantly
+    updated across ``ceil(dp_cp / Z)`` replica groups (compute-for-memory). Scalar (Adam/Lion)
+    parameters stay full-ZeRO and are unaffected.
+    
+    Set via ``--muon-zero-parallelism`` (the field name matches the arg, so it is populated
+    automatically from args). It is converted in ``validate_args`` to
+    ``num_distributed_optimizer_instances = ceil(dp_cp / Z)`` before process-group initialization."""
 
     # Lion.
     lion_beta1: float = 0.95

@@ -830,10 +830,11 @@ def _get_megatron_emerging_optimizer(
     distopt_process_groups = None
     distopt_per_model_buffers = None
     use_separate_distributed_optimizer = ddp_uses_distributed_optimizer and use_layer_wise
-    # NOTE:此拆分路径（耦合布局，use_layer_wise_param_layout=True）现在通过混合 ZeRO 支持
-    # num_distributed_optimizer_instances > 1：Muon（LayerWise）缓冲区在 intra dp_cp 组内分片
-    # （在 N 个副本之间冗余更新），而下方的同级 DistributedOptimizer 将标量（Adam/Lion）参数路由到
-    # 完整的 dp_cp 组，且 distributed_optimizer_instance_id=0（单一 owner 集合，因此 Adam 保持完整 ZeRO）。
+    # NOTE: this split path (coupled layout, use_layer_wise_param_layout=True) now supports
+    # num_distributed_optimizer_instances > 1 via hybrid ZeRO: Muon (LayerWise) buffers shard within
+    # the intra dp_cp group (redundantly updated across N replicas) while the sibling
+    # DistributedOptimizer below routes scalar (Adam/Lion) params to the full dp_cp group with
+    # distributed_optimizer_instance_id=0 (a single owner set, so Adam keeps full ZeRO).
     if use_separate_distributed_optimizer and any(
         # A separate DistributedOptimizer with byte-level sharding handles any group
         # whose optimizer is not the primary emerging optimizer (stored in ``eopt_name``,
@@ -926,7 +927,13 @@ def _get_megatron_emerging_optimizer(
                     data_parallel_group=distopt_process_groups['dp_cp_group'],
                     data_parallel_group_gloo=None,
                     data_parallel_group_idx=get_pg_rank(distopt_process_groups['mp_group']),
-                    intra_dist_opt_group=None,
+                    # Adam/Lion scalar params are full-ZeRO over the complete dp_cp group, so their
+                    # grad stats must reduce over their data_parallel_group (dp_cp). Passing None
+                    # makes DistributedOptimizer fall back to the world group (double-counting across
+                    # TP/PP), inconsistent with Muon's intra_dist_opt scope, which corrupts grad-norm
+                    # / clip / count_zeros. Use the dp_cp group explicitly; since it differs from
+                    # Muon's intra_dist_opt, the top-level ChainedOptimizer splits then merges.
+                    intra_dist_opt_group=distopt_process_groups['dp_cp_group'],
                     distributed_optimizer_instance_id=0,
                     pg_collection=pg_collection,
                     skip_megatron_wrapping=False,

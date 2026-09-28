@@ -1008,6 +1008,17 @@ def group_params_for_buffers(
 
     result = {}
     for key, param_list in key_to_params.items():
+        if key.is_expert_parallel:
+            # In paper: "flatten" order for MoE: down (linear_fc2) then gate+up (linear_fc1). The
+            # LayerWise bin-packer walks reversed(params), so placing down-proj params LAST here
+            # makes them FIRST in the flattened buffer. Stable sort preserves construction order
+            # within each projection kind; param_indices are reordered in lockstep.
+            order = sorted(
+                range(len(param_list)),
+                key=lambda i: getattr(param_list[i], 'is_moe_down_proj', False),
+            )
+            param_list = [param_list[i] for i in order]
+            key_to_indices[key] = [key_to_indices[key][i] for i in order]
         result[key] = (param_list, key_to_indices[key])
     return result
 
@@ -1131,6 +1142,9 @@ class _ParamAndGradBuffer:
         self._is_layer_wise_buffer = bool(
             self.params and getattr(self.params[0], "is_managed_by_layer_wise_optimizer", False)
         )
+        self._is_expert_parallel = bool(
+            self.params and not getattr(self.params[0], "allreduce", True)
+        )
         # Bake the per-buffer DistOpt decision into this buffer's ddp_config (single source of
         # truth; bucket groups inherit it): a LayerWise (Muon) buffer on the compact decoupled
         # layout disables DistributedOptimizer, while sibling buffers keep the model-level setting.
@@ -1139,11 +1153,15 @@ class _ParamAndGradBuffer:
         ):
             self.ddp_config = dataclasses.replace(self.ddp_config, use_distributed_optimizer=False)
 
-        # 混合 ZeRO: 标量 (非 LayerWise) buffer 在完整 dp_cp 组上保持全 ZeRO。
-        # 烘焙 num_distributed_optimizer_instances=1, 使其两段式梯度归约跳过cross-replica all-reduce,
-        # 只在完整 dp_cp 组上做一次 reduce-scatter; 而 Muon (LayerWise)
-        # buffer 保留model-lvel N (在 intra 组内分片并在 N 个副本上冗余更新)。
-        if not self._is_layer_wise_buffer:
+        # Hybrid ZeRO: bake num_distributed_optimizer_instances=1 for buffers that do NOT
+        # redundantly compute Muon updates across replicas, so their two-stage gradient
+        # reduction skips the cross-replica all-reduce and does a single reduce-scatter over
+        # the full DP group. This covers (a) scalar (non-LayerWise) buffers, which stay fully
+        # ZeRO-sharded over dp_cp, and (b) expert-parallel (MoE) buffers, which the paper
+        # shards across the FULL expert-DP group with no ZeRO parallelism limit. Only dense
+        # LayerWise (Muon) buffers keep the model-level N (intra sharding + redundant recompute
+        # across N replicas).
+        if self._is_expert_parallel or not self._is_layer_wise_buffer:
             self.ddp_config = dataclasses.replace(
                 self.ddp_config, num_distributed_optimizer_instances=1
             )
@@ -1867,27 +1885,28 @@ def partition_buckets(
             assert fp8_buffer is None
             fp8_buffer = buffer
 
-    # 一个 bucket group 在单个DP组上执行单一集合通信类型（DistOpt buffer 为
-    # reduce-scatter，否则为 all-reduce），因此合并进同一 group 的 bucket 必须在三件事上
-    # 一致：DP组、每个 buffer 生效的 ``use_distributed_optimizer``、以及
-    # ``num_distributed_optimizer_instances``。decoupled LayerWise 布局
-    # (``use_layer_wise_param_layout=False``) 让 LayerWise (Muon) buffer 的
-    # ``use_distributed_optimizer=False``，而 sibling buffer 保持 True（同一DP组）；
-    # 混合 ZeRO 布局（``num_distributed_optimizer_instances > 1``）则额外把 Muon buffer 路由到
-    # intra dp_cp 组、把标量 (Adam) buffer 路由到完整 dp_cp 组。按这三项分组，使每个 group
-    # 的集合通信保持自洽。
+    # A bucket group performs a single collective type (reduce-scatter for DistOpt buffers,
+    # all-reduce otherwise) over a single data-parallel group, so buckets merged into one group
+    # must agree on three things: the data-parallel group, the effective per-buffer
+    # ``use_distributed_optimizer``, and ``num_distributed_optimizer_instances``. The decoupled
+    # LayerWise layout (``use_layer_wise_param_layout=False``) gives LayerWise (Muon) buffers
+    # ``use_distributed_optimizer=False`` while sibling buffers keep True (same data-parallel
+    # group); the hybrid-ZeRO layout (``num_distributed_optimizer_instances > 1``) additionally
+    # routes Muon buffers to the intra dp_cp group and scalar (Adam) buffers to the full dp_cp
+    # group. Group by all three so each group's collective stays self-consistent.
     _ddp_config = buffers[0].ddp_config
 
-    # 以每个buffer为准的 collective key，使bucket组的 collective 与其布局保持一致
+    # Authoritative per-buffer collective key so a bucket group's collective matches its layout.
     _param_to_buffer = {}
     for buffer in buffers:
         for param in buffer.params:
            _param_to_buffer[param] = buffer
 
     def _collective_key(buffer):
-        """Hashable key: 决定一个 bucket group 的 collective 行为.
-        `id(data_parallel_group)` 用于区分完整的 dp_cp group 与 intra dp_cp group
-         (当 num_distributed_optimizer_instances > 1 时，二者是不同的对象).
+        """Hashable key that fully determines a bucket group's collective behavior.
+
+        ``id(data_parallel_group)`` disambiguates the full dp_cp group from the intra dp_cp
+        group (which are distinct objects when num_distributed_optimizer_instances > 1).
         """
         return (
             id(buffer.data_parallel_group),
@@ -1918,12 +1937,12 @@ def partition_buckets(
         )
         return values.pop()
 
-    # Case 1：如果 force_single_bucket_group 为 True，则将所有 bucket 放入单个 bucket group
-    # （例如 disable_bucketing / 非首个 VPP chunk）。一个 bucket group 在单个 data-parallel group 上
-    # 执行单一 collective 类型，因此按 collective key
-    # （data-parallel group + use_distributed_optimizer + num_distributed_optimizer_instances）
-    # 进行拆分，并保持顺序。当所有 buffer 都一致时（即非解耦、非混合 ZeRO 的情况），
-    # 这会坍缩为恰好一个 group，与之前的行为完全相同。
+    # Case 1: Put all buckets into a single bucket group if force_single_bucket_group is True
+    # (e.g. disable_bucketing / non-first VPP chunks). A bucket group performs a single
+    # collective type over a single data-parallel group, so split by the collective key
+    # (data-parallel group + use_distributed_optimizer + num_distributed_optimizer_instances),
+    # preserving order. When all buffers agree (the non-decoupled, non-hybrid-ZeRO case) this
+    # collapses to exactly one group, identical to the previous behavior.
     if force_single_bucket_group:
         ordered_keys = []
         buckets_by_key = {}
@@ -1962,11 +1981,11 @@ def partition_buckets(
                 )
         return bucket_groups
     else:
-        # Case 3：将非 fp8 bucket 合并到最后一个 fp8 group 中，以聚合通信。一个 bucket group
-        #       在单个 data-parallel group 上运行一种 collective 类型，因此只有那些 collective key
-        #       （data-parallel group + use_distributed_optimizer +
-        #       num_distributed_optimizer_instances）与 fp8 group 的 collective key 匹配的非 fp8 bucket
-        #       才会被合并进来；具有不同 key 的 bucket 会拥有自己的 group（一个或多个）。
+        # Case 3: merge non-fp8 buckets into the last fp8 group to aggregate comm. A bucket group
+        #         runs one collective type over one data-parallel group, so only non-fp8 buckets
+        #         whose collective key (data-parallel group + use_distributed_optimizer +
+        #         num_distributed_optimizer_instances) matches the fp8 group's are merged in;
+        #         buckets with a different key get their own group(s).
         fp8_key = _collective_key(fp8_buffer)
         matching_non_fp8_buckets = []  # merged into the fp8 group (same collective key)
         # collective key -> (list of buckets, representative buffer) for their own group(s)
@@ -2030,7 +2049,7 @@ def partition_buckets(
                 # The first N-1 bucket groups.
                 group_buckets = [bucket]
             # Merged buckets must share the fp8 group's collective key.
-            assert merged_collective_key(group_buckets) == fp8_key
+            assert _merged_collective_key(group_buckets) == fp8_key
             bucket_groups.append(
                 _ParamAndGradBucketGroup(
                     group_buckets,
@@ -2040,13 +2059,13 @@ def partition_buckets(
                 )
             )
 
-        # 将不同的非 fp8 bucket（解耦 LayerWise 或混合 ZeRO 的 sibling buffer）
-        # 路由到它们各自的 group 中，每个不同的 collective key 对应一个 group。当所有 bucket
-        # 共享 fp8 group 的 key 时为空。reduce_scatter 路径已在上面发出它们，因此不要
-        # 在那里重复发出。
+        # Route the differing non-fp8 buckets (decouple-LayerWise or hybrid-ZeRO sibling buffers)
+        # into their own group(s), one per distinct collective key. Empty when all buckets share
+        # the fp8 group's key. The reduce_scatter path already emitted them above, so don't
+        # re-emit there.
         if not reduce_scatter_with_fp32_accumulation:
             for key in ordered_differing_keys:
-                differing_buckets, differing_buffer = differing_non_fp8[key]
+                differing_buckets, differing_buffer = differing_non_fp8_by_key[key]
                 bucket_groups.append(
                     _ParamAndGradBucketGroup(
                         differing_buckets,

@@ -185,9 +185,9 @@ class DistributedDataParallel(_BaseDataParallel):
             full_param_layout = DistributedOptimizer.compute_full_param_layout(
                 all_params,
                 self.bucket_size,
-                self.intra_dp_cp_group.size(),
+                self.dp_cp_group.size(),
                 self.ddp_config,
-                expert_data_parallel_world_size=self.intra_expt_dp_group.size(),
+                expert_data_parallel_world_size=self.expt_dp_group.size(),
             )
 
         # When a full_param_layout is provided, verify that the grouping is consistent
@@ -251,16 +251,17 @@ class DistributedDataParallel(_BaseDataParallel):
         pg_collection = ProcessGroupCollection(tp=self.tp_group, dp_cp=self.dp_cp_group)
         for buffer_key, (params, param_indices) in buffer_groups.items():
             if buffer_key.is_expert_parallel:
-                # MoE (EP) Muon 矩阵：在 intra expert-DP 组内分片
-                # (大小为 expt_dp / N)，并在 N 个副本上冗余更新。
-                data_parallel_group = self.intra_expt_dp_group
+                # MoE (expert-parallel) Muon matrices: shard across the FULL expert-DP group
+                # (no ZeRO parallelism limit for MoE). Each expert param is then owned by
+                # exactly one rank, with no redundant recompute across replicas.
+                data_parallel_group = self.expt_dp_group
                 scaling_factor = expert_gradient_scaling_factor
             elif buffer_key.is_managed_by_layer_wise_optimizer:
-                # dense Muon 矩阵：在 intra dp_cp 组内分片
+                # Dense Muon matrices：shard within the intra dp_cp group (<= Z ranks).
                 data_parallel_group = self.intra_dp_cp_group
                 scaling_factor = gradient_scaling_factor
             else:
-                # Scalar (Adam/Lion) params：在完整 dp_cp 组上分片
+                # Scalar (Adam/Lion) params：full ZeRO over the whole dp_cp group.
                 data_parallel_group = self.dp_cp_group
                 scaling_factor = gradient_scaling_factor
 
@@ -333,9 +334,10 @@ class DistributedDataParallel(_BaseDataParallel):
             assert (
                 self.ddp_config.use_distributed_optimizer
             ), 'Partial DistOpt cannot be used without DistOpt'
-            # 混合 ZeRO: 只有 buffer 保留 model-level, 
-            # num_distributed_optimizer_instances > 1 (Muon/LayerWise buffer) 的 bucket group 才做cross-replica inter all-reduce,
-            # 标量 (Adam) bucket group 已被烘焙成 N=1, 不能分配 inter group / communication stream
+            # Hybrid ZeRO: only bucket groups whose buffers keep the model-level
+            # num_distributed_optimizer_instances > 1 (Muon/LayerWise buffers) take the
+            # cross-replica inter all-reduce. Scalar (Adam) bucket groups are baked to N=1 and
+            # must not be assigned the inter group / communication stream.
             for bucket_groups in [self.bucket_groups, self.expert_parallel_bucket_groups]:
                 communication_stream = torch.cuda.Stream(device=torch.cuda.current_device())
                 for bucket_group in bucket_groups:

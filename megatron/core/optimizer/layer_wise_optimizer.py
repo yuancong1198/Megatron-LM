@@ -26,6 +26,7 @@ from .optimizer import (
     FP32Optimizer,
     MegatronOptimizer,
     _get_param_grad_norm_group,
+    _is_separate_grad_norm_group,
     _validate_grad_norm_group,
 )
 from .optimizer_config import OptimizerConfig
@@ -87,19 +88,45 @@ def _param_sort_key(numel: int, identity: tuple) -> tuple:
 
 
 def tag_params_for_buffer_routing(model_chunks) -> None:
-    """Tag every requires-grad param with ``is_managed_by_layer_wise_optimizer``.
+    """Tag every requires-grad param with routing attributes before DDP wrapping.
 
     Run this once on the un-DDP-wrapped model chunks before
     :class:`DistributedDataParallel` constructs its grad/param buffers — the
-    grouping function ``group_params_for_buffers`` reads this attribute to
+    grouping function ``group_params_for_buffers`` reads these attributes to
     decide which buffer each param lands in (LayerWise shard-aligned buffer vs
-    DistOpt-style byte-level buffer).
+    DistOpt-style byte-level buffer) and, for MoE, the flatten order.
+
+    Tags set:
+
+    * ``is_managed_by_layer_wise_optimizer``: buffer routing (LayerWise vs DistOpt).
+    * ``is_moe_down_proj``: True for expert down-projection (``linear_fc2``) matrices.
+    Used to order down matrices before gate+up (``linear_fc1``) per the paper's
+    "flatten all down projections, then up, then gate" scheme.
     """
     for model_chunk in model_chunks:
-        for param in model_chunk.parameters():
+        for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
             param.is_managed_by_layer_wise_optimizer = is_managed_by_layer_wise_optimizer(param)
+            if 'linear_fc2' in name:
+                param.is_moe_down_proj = True
+
+def _grads_for_norm_in_group(optimizer, params):
+    """Gradients for the main grad-norm from one param group.
+
+    Mirrors ``MegatronOptimizer.get_grads_for_grad_norm(None)``'s per-param selection so
+    the dense/expert split yields exactly the same grad set as the pre-split code, only
+    partitioned. Delegates to ``_filter_grads_for_norm`` for MegatronOptimizer children
+    (the bf16 ``Float16OptimizerWithFloat16Params`` wrapper); falls back to plain
+    ``param.grad`` for a raw torch optimizer (fp32 Muon), where the shared and
+    TP-duplicate filters are no-ops.
+    """
+
+    param_filter = lambda p: not _is_separate_grad_norm_group(_get_param_grad_norm_group(p))
+    if hasattr(optimizer, '_filter_grads_for_norm'):
+        return optimizer._filter_grads_for_norm(params, param_filter=param_filter)
+    return [p.grad for p in params if param_filter(p) and p.grad is not None]
+
 
 
 class LayerWiseDistributedOptimizer(ChainedOptimizer):
@@ -354,16 +381,13 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             ddp_config.grad_reduce_in_fp32,
             merge_layerwise_fp8_grads=not getattr(ddp_config, 'use_layer_wise_param_layout', True),
         )
-        # 混合 ZeRO：LayerWise（Muon）缓冲区在 intra（partial-ZeRO）子组内分片
-        # （Size = full // num_distributed_optimizer_instances）；非 LayerWise（Adam）缓冲区保持
-        # 完整 DP 大小。N == 1 时 intra == full，相当于无操作。
+        # Hybrid ZeRO: dense LayerWise (Muon) buffers shard within the intra (partial-ZeRO)
+        # subgroup (size = full // num_distributed_optimizer_instances); non-LayerWise (Adam)
+        # buffers keep the full DP size. MoE (expert-parallel) buffers are handled inside the
+        # loop: they shard across the FULL expert-DP group (no ZeRO parallelism limit).
+        # N == 1 makes intra == full, a no-op.
         num_dist_opt_instances = getattr(ddp_config, 'num_distributed_optimizer_instances', 1) or 1
         intra_dp_world_size = data_parallel_world_size // num_dist_opt_instances
-        intra_expt_dp_world_size = (
-            expert_data_parallel_world_size // num_dist_opt_instances
-            if expert_data_parallel_world_size is not None
-            else None
-        )
 
         layouts = {}
         for buffer_key, (group_params, param_indices) in buffer_groups.items():
@@ -373,18 +397,16 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     if expert_data_parallel_world_size is not None
                     else data_parallel_world_size
                 )
-                layer_wise_dp_world_size = (
-                    intra_expt_dp_world_size
-                    if intra_expt_dp_world_size is not None
-                    else intra_dp_world_size
-                )
+                # MoE has no ZeRO parallelism limit: layerwise (Muon) expert matrices shard
+                # across the full expert-DP group, never the intra/capped subgroup.
+                layer_wise_dp_world_size = dp_world_size
             else:
                 dp_world_size = data_parallel_world_size
                 layer_wise_dp_world_size = intra_dp_world_size
 
-            # 逐 buffer 分派：LayerWise（Muon）参数获得与分片对齐的 layer 大小，
-            # 位于 intra 子组内；非 LayerWise 参数（例如由 Adam 管理的 embeddings、biases）获得
-            # DistOpt 的字节级布局，其大小适配完整 DP 组。
+            # Dispatch per buffer: LayerWise (Muon) params get the shard-aligned layer size
+            # the intra sub-group; non-LayerWise params (e.g. Adam-managed embeddings, biases) get
+            # DistOpt's byte-level layout sized to the full DP group.
             if buffer_key.is_managed_by_layer_wise_optimizer and decouple_ddp_layout:
                 # Decouple path (incl. FP8 param-gather): compact no-padding layout (DDP treats this
                 # buffer as non-DistOpt). Attach param_indices so DDP's consistency check passes.
@@ -611,15 +633,15 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             full_param_layouts: List of :class:`FullParamLayout` (one per model
                 chunk).  ``None`` triggers the legacy fallback.
         """
-        # 当（intra）dp_cp 组大小为 1 时进行简化。混合 ZeRO：Muon 矩阵在
-        # intra dp_cp 组内分片（大小 <= Z）；N == 1 使 intra == full，相当于无操作。
+        # Simplify when the (intra) dp_cp group size is 1. Hybrid ZeRO: Muon matrices shard within
+        # the intra dp_cp group (size <= Z); N == 1 makes intra == full, a no-op.
         dp_cp_size = get_pg_size(self.pg_collection.intra_dp_cp)
         if dp_cp_size == 1:
             self.dp_cp_params_list = None
             self.expt_dp_params_list = None
             return
 
-        expt_dp_size = get_pg_size(self.pg_collection.intra_expt_dp)
+        expt_dp_size = get_pg_size(self.pg_collection.expt_dp)
 
         if full_param_layouts is not None:
             self._shard_params_from_layout(optimizers, full_param_layouts, dp_cp_size, expt_dp_size)
@@ -629,7 +651,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     def _shard_params_from_layout(self, optimizers, full_param_layouts, dp_cp_size, expt_dp_size):
         """Derive shard assignments from the param layout."""
         dp_cp_rank = get_pg_rank(self.pg_collection.intra_dp_cp)
-        expt_dp_rank = get_pg_rank(self.pg_collection.intra_expt_dp)
+        expt_dp_rank = get_pg_rank(self.pg_collection.expt_dp)
 
         self.dp_cp_params_list = [[] for _ in range(dp_cp_size)]
         self.expt_dp_params_list = [[] for _ in range(expt_dp_size)]
@@ -767,7 +789,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # Assign params to rank in ping-pong style loop.
         for p, group_index in param_list:
             if param_groups[group_index].get("is_expert_parallel", False):
-                if expt_dp_loop[expt_dp_idx] == get_pg_rank(self.pg_collection.intra_expt_dp):
+                if expt_dp_loop[expt_dp_idx] == get_pg_rank(self.pg_collection.expt_dp):
                     param_groups_this_rank[group_index].append(p)
                 self.expt_dp_params_list[expt_dp_loop[expt_dp_idx]].append(p)
                 expt_dp_idx = (expt_dp_idx + 1) % len(expt_dp_loop)
@@ -827,7 +849,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                         continue
                     if self.expt_dp_params_list is not None:
                         bucket_params_list = [
-                            [] for _ in range(get_pg_size(self.pg_collection.intra_expt_dp))
+                            [] for _ in range(get_pg_size(self.pg_collection.expt_dp))
                         ]
                         for bucket_list, full_params_list in zip(
                             bucket_params_list, self.expt_dp_params_list
@@ -980,7 +1002,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         if self.dp_cp_params_list:
             _dispatch(self.dp_cp_params_list, self.pg_collection.intra_dp_cp)
         if self.expt_dp_params_list:
-            _dispatch(self.expt_dp_params_list, self.pg_collection.intra_expt_dp)
+            _dispatch(self.expt_dp_params_list, self.pg_collection.expt_dp)
 
     @torch.no_grad()
     def broadcast_params(self):
@@ -995,17 +1017,18 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         if self.expt_dp_params_list is None:
             return
         for i, params in enumerate(self.expt_dp_params_list):
-            src_global_rank = torch.distributed.get_global_rank(self.pg_collection.intra_expt_dp, i)
+            src_global_rank = torch.distributed.get_global_rank(self.pg_collection.expt_dp, i)
             for p in params:
-                torch.distributed.broadcast(p, src_global_rank, self.pg_collection.intra_expt_dp)
+                torch.distributed.broadcast(p, src_global_rank, self.pg_collection.expt_dp)
 
     def _grad_stats_parallel_group(self):
         """Grad-norm / count-zeros reduction group.
 
-        在混合 ZeRO（num_distributed_optimizer_instances > 1）下，Muon 梯度由 N 个副本组
-        冗余持有，因此全局归约会将其重复计数 N 次。
-        改为在一个副本内（intra_dist_opt）进行归约。当 N == 1（或 intra 组不可用，
-        例如解耦路径）时，返回 None —— 即全局组 —— 与之前的行为一致。
+        With hybrid ZeRO (num_distributed_optimizer_instances > 1), the Muon gradient is
+        redundantly held by N replica groups, so reducing globally would over-count it N times.
+        Reduce within one replica (intra_dist_opt) instead. When N == 1 (or the intra group is
+        unavailable, e.g. the decoupled path) this returns None – the global group – matching the
+        prior behavior.
         """
         if self.pg_collection is None:
             return None
@@ -1013,15 +1036,67 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         inter = getattr(self.pg_collection, 'inter_dist_opt', None)
         return intra if inter is not None else None
 
+    def get_grad_stats_parallel_group(self):
+        """The grad-stats reduction group, exposed for the top-level ChainedOptimizer.
+
+        Overrides ChainedOptimizer (whose default asserts all sub-optimizers share one group) to
+        return the group Muon actually reduces over (intra_dist_opt, or None when N == 1). In the
+        coupled path ``ChainedOptimizer([LayerWise(Muon), DistributedOptimizer(Adam)])`` this makes
+        ``grads_states_parallel_group_is_shared()`` deterministically detect that Muon
+        (intra_dist_opt) and Adam (dp_cp) use different groups and take the split-reduce + sqrt-merge
+        branch, instead of relying on the accidental ``model_parallel_group != dp_cp``.
+        """
+        return self._grad_stats_parallel_group()
+
+
     @torch.no_grad()
     def get_grad_norm(self):
-        grads_for_norm = []
+        # MoE (expert-parallel) Muon matrices are sharded across the FULL expert-DP
+        # group with no ZeRO parallelism limit, while dense Muon matrices stay redundantly
+        # computed across num_distributed_optimizer_instances replicas. Their norms must
+        # therefore reduce over different process groups: dense grads over intra_dist_opt
+        # (avoiding N-fold over-counting across replicas) and expert grads over the full
+        # expt_dp group. Split the two sets and combine via sqrt(dense^2 + expert^2).
+        dense_grads = []
+        expert_grads = []
+
         for optimizer in self.chained_optimizers:
-            grads_for_norm += optimizer.get_grads_for_grad_norm()
-        grad_norm = get_grad_norm_fp32(
-            grads_for_norm, grad_stats_parallel_group=self._grad_stats_parallel_group()
+            # The per-group is_expert_parallel tag lives on the underlying torch optimizer
+            # param_groups. For bf16 the child is Float16OptimizerWithFloat16Params and those
+            # groups are on its wrapped optimizer; for fp32 the child is the raw torch optimizer.
+            inner = getattr(optimizer, 'optimizer', None)
+            param_groups = (
+                inner.param_groups
+                if inner is not None and hasattr(inner, 'param_groups')
+                else optimizer.param_groups
+            )
+            for group in param_groups:
+                grads = _grads_for_norm_in_group(optimizer, group['params'])
+                if group.get('is_expert_parallel', False):
+                    expert_grads.extend(grads)
+                else:
+                    dense_grads.extend(grads)
+
+        # If the full expert-DP group is unavailable (legacy/decoupled path without a
+        # pg_collection), fold expert grads back into the dense set so they are still
+        # counted, preserving the pre-split behavior of a single combined reduction.
+        expert_group = (
+            getattr(self.pg_collection, 'expt_dp', None) if self.pg_collection is not None else None
         )
-        return grad_norm
+
+        if expert_group is None:
+            dense_grads.extend(expert_grads)
+            expert_grads = []
+
+        dense_norm = get_grad_norm_fp32(
+            dense_grads, grad_stats_parallel_group=self._grad_stats_parallel_group()
+        )
+        expert_norm = 0.0
+        if expert_group is not None:
+            expert_norm = get_grad_norm_fp32(
+                expert_grads, grad_stats_parallel_group=expert_group
+            )
+        return (dense_norm**2 + expert_norm**2) ** 0.5
 
     def has_grad_norm_group(self, grad_norm_group: str) -> bool:
         """Whether any global rank owns params for a registered grad-norm group.
@@ -1175,10 +1250,10 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             model_sharded_state_dict, is_loading, **kwargs
         )
 
-        # 混合 ZeRO：Muon 动量由 N 个副本组冗余持有。将跨副本索引编码到
-        # replica_id 的 DP 分量中（当 num_distributed_optimizer_instances == 1，
-        # 即固定 DP 场景时为 0），这样 N 份副本在保存时去重到主副本
-        # （inter_rank == 0），并在加载时重建。
+        # Hybrid ZeRO: the Muon momentum is redundantly held by N replica groups. Encode the
+        # inter-replica index in the DP component of replica_id (0 when
+        # num_distributed_optimizer_instances == 1, i.e. the fixed-DP case), so the N copies dedup
+        # to the main replica (inter_rank == 0) on save and reconstruct on load.
         inter_rank = 0
         if self.pg_collection is not None and getattr(
             self.pg_collection, 'inter_dist_opt', None

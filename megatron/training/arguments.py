@@ -1897,6 +1897,50 @@ def validate_args(args, defaults={}):
         ], "Emerging optimizer supports torch and torch_dist checkpoint format."
 
     if args.use_layer_wise_distributed_optimizer:
+        # Hybrid ZeRO: muon_zero_parallelism (Z) is the max ZeRO sharding group size for Muon
+        # dense matrices. Convert it to num_distributed_optimizer_instances (N = ceil(dp_cp / Z)),
+        # so Muon matrices are sharded over <= Z ranks and redundantly updated across N replica
+        # groups (compute-for-memory), while Adam/Lion scalar params stay full-ZeRO. This conversion
+        # must run before initialize_model_parallel (i.e. here, in validate_args).
+        muon_zero_parallelism = getattr(args, 'muon_zero_parallelism', 0)
+        if muon_zero_parallelism > 0:
+            assert args.use_layer_wise_param_layout, (
+                "muon_zero_parallelism > 0 requires the padded LayerWise layout "
+                "(--use-layer-wise-param-layout): the decoupled compact layout only supports "
+                "num_distributed_optimizer_instances == 1."
+            )
+            dp_cp = args.data_parallel_size * args.context_parallel_size
+            if muon_zero_parallelism < dp_cp:
+                num_instances = -(dp_cp // muon_zero_parallelism) # ceil(dp_cp / Z)
+                assert dp_cp % num_instances == 0, (
+                    f"muon_zero_parallelism={muon_zero_parallelism} yields "
+                    f"num_distributed_optimizer_instances={num_instances}, which must evenly "
+                    f"divide data_parallel_size * context_parallel_size = {dp_cp}."
+                    f"Choose a Z that divides dp*cp evenly."
+                )
+                # MoE (expert-parallel) Muon matrices are sharded across the FULL expert-DP group
+                # (no ZeRO limit). This assert only keeps the partial-ZeRO intra_expt_dp process
+                # group well-formed; MoE no longer shards over intra_expt_dp.
+                expert_parallel_size = getattr(args, 'expert_model_parallel_size', 1) or 1
+                if expert_parallel_size > 1:
+                    expert_dp = (
+                        args.data_parallel_size
+                        * args.tensor_model_parallel_size
+                        * args.context_parallel_size
+                        // (args.expert_tensor_parallel_size * expert_parallel_size)
+                    )
+                    assert expert_dp % num_instances == 0, (
+                        f"muon_zero_parallelism={muon_zero_parallelism} yields "
+                        f"num_distributed_optimizer_instances={num_instances}, which must evenly "
+                        f"divide the expert data-parallel size {expert_dp} "
+                        f"(data_parallel_size {args.data_parallel_size} * tp "
+                        f"{args.tensor_model_parallel_size} * cp {args.context_parallel_size} "
+                        f"/ (etp {args.expert_tensor_parallel_size} * ep {expert_parallel_size})). "
+                        f"Choose a Z whose derived N divides both dp*cp and expert_dp."
+                    )
+                args.num_distributed_optimizer_instances = num_instances
+        # muon_zero_parallelism >= dp_cp: no cap, keep N == 1
+
         if not args.use_layer_wise_param_layout:
             # Decoupled compact LayerWise: fp8 parameter gather is supported via the FP8-aware
             # whole-param all-gather. Only mxfp8/blockwise (fp4 out of scope); mxfp8 needs
@@ -4351,6 +4395,16 @@ def _add_distributed_args(parser):
         type=int,
         default=1,
         help='Number of Distributed Optimizer copies across Data Parallel domain.',
+    )
+    group.add_argument(
+        '--muon-zero-parallelism',
+        type=int,
+        default=0,
+        help='Maximum ZeRO sharding group size for Muon (dense matrix) parameters. '
+        '0 = no limit (full ZeRO over the current data-parallel group, i.e. current behavior). '
+        'Z >= 1: shard Muon matrices over min(dp_cp, Z) ranks and redundantly compute the Muon '
+        'update across ceil(dp_cp / Z) replica groups (compute-for-memory); scalar (Adam/Lion) '
+        'parameters stay full-ZeRO and are unaffected. Requires --use-layer-wise-param-layout.',
     )
     group.add_argument(
         '--torch-fsdp2-no-reshard-after-forward',
