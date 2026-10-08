@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 from functools import partial
+import types
 from unittest import mock
 
 import pytest
@@ -845,7 +846,8 @@ class TestLayerWiseOptimizer:
 
     @pytest.mark.parametrize('tp', [1, 2])
     @pytest.mark.parametrize('pp', [1, 2])
-    def test_optimizer_common_state_dict_hybrid_moe(self, tmp_path_dist_ckpt, tp, pp):
+    @pytest.mark.parametrize('bf16', [True, False])
+    def test_optimizer_common_state_dict_hybrid_moe(self, tmp_path, dist_ckpt, bf16):
         """End-to-end `save_checkpoint`/`load_checkpoint` roundtrip on the hybrid
         LayerWise + DistributedOptimizer path with an MoE model.
 
@@ -878,7 +880,7 @@ class TestLayerWiseOptimizer:
                     tp=tp,
                     pp=pp,
                     ep=ep,
-                    bf16=True,
+                    bf16=bf16,
                     dist_opt=True,
                     optimizer='dist_muon',
                     use_param_layout=True,
@@ -903,7 +905,7 @@ class TestLayerWiseOptimizer:
                     tp=tp,
                     pp=pp,
                     ep=ep,
-                    bf16=True,
+                    bf16=bf16,
                     dist_opt=True,
                     optimizer='dist_muon',
                     use_param_layout=True,
