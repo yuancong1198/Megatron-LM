@@ -285,6 +285,10 @@ class OptimizerConfig:
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
 
+    muon_use_batched_ns: bool = False
+    """Whether to batch same-shape matrix parameters into a single 3D Newton-Schulz call during
+    the Muon update, amortizing kernel-launch overhead. Requires TP=1. Defaults to False."""
+
     muon_scalar_optimizer: str = 'adam'
     """Optimizer for nonlinear parameters (embeddings, biases, norms) when using muon.
     One of 'adam' or 'lion'. Defaults to 'adam'."""
