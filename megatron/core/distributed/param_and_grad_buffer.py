@@ -44,7 +44,10 @@ from ..fp8_utils import (
 from ..optimizer.param_layout import pad_bucket_end, pad_param_start
 from ..utils import is_torch_min_version, log_on_each_pipeline_stage
 from .distributed_data_parallel_config import DistributedDataParallelConfig
-from .reduce_scatter_with_fp32_accumulation import reduce_scatter_with_fp32_accumulation
+from .reduce_scatter_with_fp32_accumulation import (
+    reduce_scatter_with_bf16_stochastic_rounding,
+    reduce_scatter_with_fp32_accumulation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -268,11 +271,30 @@ class _ParamAndGradBucketGroup:
         # one is allocated.
         self.previous_grad_reduce_bucket_group = None
 
+        # Derive per-group buffer traits from the first bucket's first param. Buckets within a
+        # single `partition_buckets` call are homogeneous in expert-ness (DistributedDataParallel
+        # partitions expert-parallel and dense buffers separately), so the first param is
+        # representative.
+        first_params = self.buckets[0].params_list if self.buckets else []
+        self.is_layer_wise_buffer = bool(
+            first_params and getattr(first_params[0], "is_managed_by_layer_wise_optimizer", False)
+        )
+        self.is_expert_parallel = bool(
+            first_params and not getattr(first_params[0], "allreduce", True)
+        )
+
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             self.inter_distributed_optimizer_instance_group = None
             self.communication_stream = None
+            # Two-stage reduce-scatter variants require a single optimizer instance. Expert-parallel
+            # buffers are baked to num_distributed_optimizer_instances == 1 (they never reach this
+            # branch), and dense LayerWise (Muon) buffers in hybrid ZeRO keep N > 1 but simply fall
+            # back to the standard reduce-scatter (the two-stage variants apply to their expert
+            # sibling buffers instead). Non-LayerWise buffers (standard DistOpt) keep the hard error
+            # to catch the unsupported flag combination.
             assert (
                 not self.ddp_config.reduce_scatter_with_fp32_accumulation
+                or self.is_layer_wise_buffer
             ), "RS w/ FP32 accumulation not supported with num_distributed_optimizer_instances > 1"
 
         reduction_collective = (
@@ -285,13 +307,31 @@ class _ParamAndGradBucketGroup:
             f"{self.ddp_config.use_distributed_optimizer=}",
         )
 
-        global dist_reduce_scatter_func
-        if self.ddp_config.reduce_scatter_with_fp32_accumulation:
-            dist_reduce_scatter_func = reduce_scatter_with_fp32_accumulation
+        # Select the reduce-scatter implementation for this bucket group. MoE (expert-parallel)
+        # gradients may use BF16 stochastic-rounding quantization to halve communication, or the
+        # two-stage all-to-all + local-FP32-sum reduce-scatter (both build on the same FP32-sum
+        # work handle). Dense buffers keep the standard ring/tree reduce-scatter, except for the
+        # pre-existing two-stage FP32-accum path when num_distributed_optimizer_instances == 1.
+        self.reduce_scatter_func = dist_reduce_scatter_func
+        if self.is_expert_parallel and self.ddp_config.reduce_scatter_with_bf16_stochastic_rounding:
+            self.reduce_scatter_func = reduce_scatter_with_bf16_stochastic_rounding
+        elif self.is_expert_parallel and self.ddp_config.reduce_scatter_with_fp32_accumulation:
+            self.reduce_scatter_func = reduce_scatter_with_fp32_accumulation
+        elif (
+            self.ddp_config.reduce_scatter_with_fp32_accumulation
+            and self.ddp_config.num_distributed_optimizer_instances == 1
+        ):
+            self.reduce_scatter_func = reduce_scatter_with_fp32_accumulation
+
+        # True when this group uses a two-stage (all-to-all + local FP32 sum) reduce-scatter that
+        # pins an intermediate all-to-all output tensor until .wait(). DistributedDataParallel reads
+        # this to link predecessor groups for early draining of that intermediate buffer.
+        self.uses_custom_reduce_scatter = self.reduce_scatter_func is not dist_reduce_scatter_func
+        if self.uses_custom_reduce_scatter:
             log_single_rank(
                 logger,
                 logging.INFO,
-                "Using reduce_scatter_with_fp32_accumulation as reduce-scatter implementation",
+                f"Using {self.reduce_scatter_func.__name__} as reduce-scatter implementation",
             )
 
         # per_param_grad_ready_counts is a dict mapping parameters to number of times
@@ -766,7 +806,7 @@ class _ParamAndGradBucketGroup:
                     local_data_view = self.cached_grad_buffer_shard_list[idx][
                         self.intra_distributed_optimizer_instance_rank
                     ]
-                    grad_reduce_handle = dist_reduce_scatter_func(
+                    grad_reduce_handle = self.reduce_scatter_func(
                         local_data_view,
                         bucket.grad_data,
                         op=reduce_op,
@@ -812,10 +852,10 @@ class _ParamAndGradBucketGroup:
                     )
 
         if async_op:
-            if self.ddp_config.reduce_scatter_with_fp32_accumulation and not force_all_reduce:
+            if self.reduce_scatter_func and not force_all_reduce:
                 assert (
                     len(self.buckets) == 1
-                ), "Only 1 bucket supported with reduce_scatter_with_fp32_accumulation=True"
+                ), "Only 1 bucket supported with the custom two-stage reduce-scatter"
                 # torch.distributed._coalescing_manager does not correctly handle calling our custom
                 # collective handle's .wait() method, so we take matters into our own hands here.
                 assert grad_reduce_handle is not None

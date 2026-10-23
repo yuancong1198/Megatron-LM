@@ -377,21 +377,19 @@ class DistributedDataParallel(_BaseDataParallel):
                     )
 
         # Set `previous_grad_reduce_bucket_group` so each bucket group can drain its predecessor's
-        # reduce-scatter at dispatch time. Only needed for reduce_scatter_with_fp32_accumulation,
-        # which holds an intermediate all-to-all output tensor pinned until .wait() runs; without
-        # this draining, all such tensors stay live until end-of-step. The fp32-accum path asserts
-        # num_distributed_optimizer_instances == 1 elsewhere, so we only link in that case.
-        # Grad-reduce dispatches happen in forward order of bucket_groups during backward (buckets
-        # closer to the output finish their gradients first), so bucket_groups[i]'s immediate
-        # predecessor in dispatch order is bucket_groups[i-1].
-        if (
-            self.ddp_config.overlap_grad_reduce
-            and self.ddp_config.reduce_scatter_with_fp32_accumulation
-            and self.ddp_config.num_distributed_optimizer_instances == 1
-        ):
+        # reduce-scatter at dispatch time. Only needed for the two-stage reduce-scatter variants
+        # (reduce_scatter_with_fp32_accumulation / reduce_scatter_with_bf16_stochastic_rounding),
+        # which hold an intermediate all-to-all output tensor pinned until .wait() runs; without
+        # this draining, all such tensors stay live until end-of-step. Link a successor to its
+        # predecessor only when the predecessor uses a two-stage variant, so we never early-wait a
+        # standard (coalesced) collective. Grad-reduce dispatches happen in forward order of
+        # bucket_groups during backward (buckets closer to the output finish their gradients first),
+        # so bucket_groups[i]'s immediate predecessor in dispatch order is bucket_groups[i-1].
+        if self.ddp_config.overlap_grad_reduce:
             for bucket_groups in [self.bucket_groups, self.expert_parallel_bucket_groups]:
                 for i in range(1, len(bucket_groups)):
-                    bucket_groups[i].previous_grad_reduce_bucket_group = bucket_groups[i - 1]
+                    if bucket_groups[i - 1].uses_custom_reduce_scatter:
+                        bucket_groups[i].previous_grad_reduce_bucket_group = bucket_groups[i - 1]
 
         # Create map from param to bucket group, used in pre_hook.
         for bucket_groups in [self.bucket_groups, self.expert_parallel_bucket_groups]:

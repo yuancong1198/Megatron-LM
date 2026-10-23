@@ -23,6 +23,7 @@ from .optimizer_config import ParamKey, ParamPredicate
 
 try:
     from emerging_optimizers import registry
+    from emerging_optimizers import utils
     from emerging_optimizers.orthogonalized_optimizers import (
         AdaptiveMuon,
         OrthogonalizedOptimizer,
@@ -178,6 +179,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         extra_scale_factor: float = 1.0,
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed"] = "duplicated",
+        use_batched_ns: bool = False,
     ) -> None:
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
@@ -213,6 +215,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         self.split_qkv = split_qkv
         self.is_qkv_fn = is_qkv_fn
         self.qkv_split_shapes = qkv_split_shapes
+        self.use_batched_ns = use_batched_ns
 
         weight_decay_method = "decoupled" if use_decoupled_weight_decay else "l2"
         # Use explicit class call instead of super() so that subclasses with
@@ -230,19 +233,14 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             scaled_orthogonalize_fn=scaled_orthogonalize_fn,
         )
 
-    def orthogonalize(self, p: torch.Tensor, grad: torch.Tensor, **kwargs: Any) -> torch.Tensor:
-        """Orthogonalize the momentum.
+    def _resolve_tp_group_partition(
+        self, p: torch.Tensor
+    ) -> tuple[Optional[torch.distributed.ProcessGroup], Optional[int]]:
+        """Resolve the (tp_group, partition_dim) used to orthogonalize a parameter.
 
-        Args:
-            p: The parameter tensor. i is necessary to pass param tensor in addition to
-                momentum because a lot of information is only available in the param tensor,
-                attributes for example.
-            grad: The momentum tensor.
-
-        Returns:
-            The orthogonalized gradient tensor.
+        With TP=1 (or a size-1 tp_group) `partition_dim` is None, so the batched and 
+        per-parameter orthogonalization paths are equivalent.
         """
-        # TODO(deyuf): switch to group
         if self.pg_collection:
             tp_group = (
                 self.pg_collection.expt_tp
@@ -254,6 +252,22 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         partition_dim = None if self.tp_mode == "blockwise" else getattr(p, "partition_dim", None)
         if partition_dim == -1:
             partition_dim = None
+        return tp_group, partition_dim
+
+    def orthogonalize(self, p: torch.Tensor, grad: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        """Orthogonalize the momentum.
+
+        Args:
+            p: The parameter tensor. it is necessary to pass param tensor in addition to
+            momentum because a lot of information is only available in the param tensor,
+            attributes for example.
+            grad: The momentum tensor.
+
+        Returns:
+            The orthogonalized gradient tensor.
+        """
+        # TODO(deyuf): switch to group
+        tp_group, partition_dim = self._resolve_tp_group_partition(p)
 
         if self.split_qkv and self.is_qkv_fn(p):  # type: ignore[misc]
             grad_shape = grad.shape
@@ -289,6 +303,81 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         else:
             grad = self.scaled_orthogonalize_fn(grad, tp_group, partition_dim)
         return grad
+
+    def _orthogonalize_and_update(self, items: list, group: dict) -> None:
+        """Orthogonalize grads (batching same-shape params) and apply the per-param update.
+
+        Non-QKV params are grouped by (shape, tp_group identity, partition_dim); a group with
+        more than one member is stacked into a single 3D tensor and orthogonalized in one batched
+        Newton-Schulz call. Each 2D slice is orthogonalized independently (`newton_schulz` uses
+        `baddbmm` for 3D inputs), so the result is mathematically equivalent to per-parameter
+        calls. QKV params are split per-parameter via :meth:`orthogonalize`.
+        """
+        batched_groups: dict = {}
+        singles: list = []
+        for p, grad in items:
+            tp_group, partition_dim = self._resolve_tp_group_partition(p)
+            if self.split_qkv and self.is_qkv_fn(p):  # type: ignore[misc]
+                singles.append((p, self.orthogonalize(p, grad)))
+                continue
+            key = (grad.shape, id(tp_group) if tp_group is not None else None, partition_dim)
+            batched_groups.setdefault(key, []).append((p, grad, tp_group, partition_dim))
+
+        updates = list(singles)
+        for members in batched_groups.values():
+            if len(members) == 1:
+                p, grad, tp_group, partition_dim = members[0]
+                updates.append((p, self.scaled_orthogonalize_fn(grad, tp_group, partition_dim)))
+            else:
+                stacked = torch.stack([grad for (_, grad, _, _) in members], dim=0)
+                _, _, tp_group, partition_dim = members[0]
+                orth_stacked = self.scaled_orthogonalize_fn(stacked, tp_group, partition_dim)
+                updates.extend(
+                    (p, orth) for (p, _, _, _), orth in zip(members, orth_stacked.unbind(0))
+                )
+
+        for p, orth in updates:
+            self.pre_weight_update_fn_inplace(p, orth)
+            p.add_(orth, alpha=-group["lr"])
+            self.post_weight_update_fn_inplace(p)
+
+    @torch.no_grad()  # type: ignore[misc]
+    def step(self, closure: Optional[Callable] = None) -> Optional[float]:
+        """Perform a single optimization step.
+
+        When ``use_batched_ns`` is True, non-QKV parameters whose gradients share a shape are
+        stacked into one 3D tensor and orthogonalized in a single batched Newton-Schulz call,
+        amortizing kernel-launch overhead. Otherwise this delegates to
+        :meth:`OrthogonalizedOptimizer.step` for the per-parameter path (the default).
+        """
+        if closure is not None:
+            raise ValueError("closure is not supported")
+        if not self.use_batched_ns:
+            return OrthogonalizedOptimizer.step(self, closure)
+        for group in self.param_groups:
+            self._init_group(group)
+
+            # Phase 1: per-parameter weight decay + EMA momentum + (optional) Nesterov, identical
+            # to the base loop, collecting the gradient to orthogonalize.
+            to_orthogonalize = []
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                state = self.state[p]
+                self._apply_weight_decay_inplace(p, grad, group["lr"], group["weight_decay"])
+                state["momentum_buffer"].lerp_(grad, 1 - group["momentum"])
+                if self.nesterov:
+                    grad = grad.lerp(state["momentum_buffer"], group["momentum"])
+                else:
+                    grad = state["momentum_buffer"]
+                to_orthogonalize.append((p, grad))
+
+            # Phase 2: orthogonalize (batched when possible) and apply the per-param update.
+            with utils.fp32_matmul_precision(self.fp32_matmul_prec):
+                self._orthogonalize_and_update(to_orthogonalize, group)
+
+        return None
 
 
 class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
@@ -343,6 +432,7 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         moment2_method: Literal["adamuon", "normuon"] = "adamuon",
         beta2: float = 0.95,
         eps: float = 1e-8,
+        use_batched_ns: bool = False,
     ) -> None:
         TensorParallelMuon.__init__(
             self,
@@ -362,6 +452,7 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
             extra_scale_factor=extra_scale_factor,
             pg_collection=pg_collection,
             tp_mode=tp_mode,
+            use_batched_ns=use_batched_ns,
         )
         self.scale_mode = scale_mode
         self.extra_scale_factor = extra_scale_factor

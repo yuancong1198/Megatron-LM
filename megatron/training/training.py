@@ -2694,6 +2694,9 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
         kwargs["reduce_scatter_with_fp32_accumulation"] = (
             args.ddp_reduce_scatter_with_fp32_accumulation
         )
+        kwargs["reduce_scatter_with_bf16_stochastic_rounding"] = (
+            args.ddp_reduce_scatter_with_bf16_stochastic_rounding
+        )
         kwargs["param_name_patterns_for_fp32_local_accumulation"] = tuple(
             args.ddp_param_name_patterns_for_fp32_local_accumulation
         )

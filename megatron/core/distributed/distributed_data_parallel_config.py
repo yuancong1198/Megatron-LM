@@ -78,6 +78,12 @@ class DistributedDataParallelConfig:
        over the wire (using an all-to-all to keep total communication overhead in line
        with the standard ring implementation) but performs accumulation locally in FP32."""
 
+    reduce_scatter_with_bf16_stochastic_rounding: bool = False
+    """If true, quantize MoE (expert-parallel) gradients from FP32 to BF16 with stochastic
+      rounding before their reduce-scatter, halving the communicated volume. The all-to-all
+      runs in BF16 and the shards are summed locally in FP32 to avoid accumulation error.
+      Requires num_distributed_optimizer_instances == 1 for the expert-parallel buffers."""
+
     param_name_patterns_for_fp32_local_accumulation: Tuple[str, ...] = ()
     """List of param_name patterns (in Python's fnmatch format) to match against to do
        local gradient accumulation in FP32. The special pattern 'all' matches every

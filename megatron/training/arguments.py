@@ -3441,6 +3441,13 @@ def _add_regularization_args(parser):
         help='Additional scale factor for the muon update',
     )
     group.add_argument(
+        '--muon-use-batched-ns',
+        action='store_true',
+        default=False,
+        help='Batch same-shape matrix parameters into a single 3D Newton-Schulz call during the '
+        'Muon update, amortizing kernel-launch overhead. Requires TP=1.',
+        )
+    group.add_argument(
         '--muon-scalar-optimizer',
         type=str,
         default='adam',
@@ -4264,6 +4271,14 @@ def _add_distributed_args(parser):
         'values over the wire (using an all-to-all to keep total communication overhead in line '
         'with the standard ring implementation) but performs accumulation locally in FP32.',
     )
+    group.add_argument(
+        '--ddp-reduce-scatter-with-bf16-stochastic-rounding',
+        action='store_true',
+        default=False,
+        help='If set, quantize MoE (expert-parallel) gradients from FP32 to BF16 with '
+        'stochastic rounding before their reduce-scatter, halving the communicated volume. '
+        'The all-to-all runs in BF16 and the shards are summed locally in FP32.',
+        )
     group.add_argument(
         '--ddp-param-name-patterns-for-fp32-local-accumulation',
         nargs='+',
