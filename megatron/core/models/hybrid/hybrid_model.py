@@ -70,6 +70,8 @@ def _get_hash_moe_layer_threshold(main_pattern: str | None, n_hash_layers: int) 
         if layer_type == Symbols.MOE
     ]
     if n_hash_layers > len(moe_layer_numbers):
+        if len(moe_layer_numbers) == 0:
+            return n_hash_layers
         raise ValueError(
             f"moe_n_hash_layers={n_hash_layers} exceeds the {len(moe_layer_numbers)} "
             "MoE layers in the main hybrid layer pattern."

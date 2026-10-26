@@ -408,9 +408,22 @@ def hybrid_dsv4_stack_spec(config):
         _get_backend_spec_provider,
         get_dsv4_hybrid_module_spec_for_backend,
     )
+    from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
 
     backend = _get_backend_spec_provider(config)
     dsv4_attention = get_dsv4_hybrid_module_spec_for_backend(config, backend)
+
+    # Every real DSv4 layer is attention + MoE (no dense MLP), so each attention
+    # layer below carries this MoE as its ``mlp`` submodule rather than a separate
+    # 'E' hybrid layer. Use SequentialMLP experts (moe_grouped_gemm=False) so the
+    # exported keys match the raisa ``hybrid_dsv4_stack_spec_local``, which hardcodes
+    # the same non-grouped layout.
+
+    moe = get_moe_module_spec(
+        use_te=True,
+        num_experts=config.num_moe_experts or 8,  # must not be None
+        moe_grouped_gemm=False,
+)
 
     def _wrap_dsv4_layer(compress_ratio=None):
         # Wrap the DSv4 attention in a hybrid TransformerLayer. When compress_ratio is given
@@ -427,7 +440,12 @@ def hybrid_dsv4_stack_spec(config):
         return ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
-                input_layernorm=TENorm, self_attention=attn, self_attn_bda=get_bias_dropout_add
+                input_layernorm=TENorm,
+                self_attention=attn,
+                self_attn_bda=get_bias_dropout_add,
+                pre_mlp_layernorm=TENorm,
+                mlp=moe,
+                mlp_bda=get_bias_dropout_add,
             ),
         )
 
